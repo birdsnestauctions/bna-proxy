@@ -1,6 +1,7 @@
 const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
+const { timerHandler } = require('./timer');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -34,6 +35,10 @@ app.post('/graphql', async (req, res) => {
     res.status(500).json({ errors: [{ message: err.message }] });
   }
 });
+
+// Email countdown timer: /timer?end=2026-10-15T19:05 (Eastern)
+app.get('/timer', timerHandler);
+app.get('/timer.gif', timerHandler);
 
 app.get('/', (req, res) => res.send('BNA proxy running.'));
 
