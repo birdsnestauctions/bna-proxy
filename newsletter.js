@@ -65,7 +65,7 @@ function auctionStory(descriptionHtml) {
 
 function firstSentences(text, n = 2) {
   // Split on sentence ends, but not after abbreviations like "Co." or "No."
-  const parts = text.split(/(?<!\b(?:Co|No|St|Mr|Mrs|Dr|Jr|Sr|Inc|Ltd|vs|approx))(?<=[.!?])\s+(?=[A-Z“"(])/);
+  const parts = text.split(/(?<!\b(?:Co|No|St|Mr|Mrs|Dr|Jr|Sr|Inc|Ltd|vs|approx)\.)(?<!\b[A-Z]\.[A-Z]\.)(?<=[.!?])\s+(?=[A-Z“"(])/);
   return parts.slice(0, n).join(' ').trim();
 }
 
@@ -155,9 +155,10 @@ async function writeBlurb(a, story) {
       body: JSON.stringify({ model: BLURB_MODEL, max_tokens: 400, messages: [{ role: 'user', content: blurbPrompt(a, story) }] }),
       signal: ctrl.signal,
     });
-    const data = await r.json();
+    const raw = await r.text();
+    let data; try { data = JSON.parse(raw); } catch { throw new Error(`Claude proxy ${r.status}: ${raw.slice(0, 200)}`); }
     const text = data?.content?.[0]?.text?.trim();
-    if (!text) throw new Error(data?.error?.message || 'Empty response');
+    if (!text) throw new Error(`Claude proxy ${r.status}: ${data?.error?.message || JSON.stringify(data).slice(0, 200)}`);
     return text.replace(/^["“]|["”]$/g, '').trim();
   } finally {
     clearTimeout(timer);
@@ -167,15 +168,16 @@ async function writeBlurb(a, story) {
 async function getBlurb(a, story, refresh) {
   const key = a.id + ':' + crypto.createHash('sha1').update(story).digest('hex');
   if (!refresh && blurbCache.has(key)) return blurbCache.get(key);
-  let blurb, ai = true;
+  let blurb, ai = true, error = null;
   try {
     blurb = await writeBlurb(a, story);
   } catch (err) {
     console.error(`Blurb failed for auction ${a.id}:`, err.message);
     blurb = firstSentences(story, 2);
     ai = false;
+    error = err.name === 'AbortError' ? 'Timed out waiting for the Claude proxy' : err.message;
   }
-  const result = { blurb, ai };
+  const result = { blurb, ai, error };
   if (ai) blurbCache.set(key, result); // don't cache fallbacks; try AI again next time
   return result;
 }
@@ -192,7 +194,7 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
 
   return Promise.all(live.map(async ({ a, closeMs }) => {
     const story = auctionStory(a.info.description);
-    const { blurb, ai } = await getBlurb(a, story, refresh);
+    const { blurb, ai, error } = await getBlurb(a, story, refresh);
     const opensMs = Date.parse(a.auctionSchedule.biddingStartDate || '') || null;
     const upcoming = a.info.progressStatus === 'UPCOMING' || (opensMs && opensMs > now);
     const closingSoon = !upcoming && closeMs - now <= CLOSING_SOON_HOURS * 3600 * 1000;
@@ -211,6 +213,7 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
       tag: upcoming && opensMs ? `Opens ${shortDay(opensMs)}` : closingSoon ? 'Closing soon!' : '',
       blurb,
       blurbIsAI: ai,
+      ...(error ? { blurbError: error } : {}),
     };
   }));
 }
@@ -277,7 +280,7 @@ function previewPage(items, html) {
   <a href="?refresh=1" onclick="this.textContent='Rewriting…'">Rewrite blurbs</a>
 </div>
 <p class="note">Paste into a <b>Code</b> element in your EmailOctopus newsletter, replacing the old Current Auctions section. Timers update on every open.
-${fallback ? `<br><span class="warn">${fallback} blurb${fallback === 1 ? '' : 's'} couldn't be AI-written and used the first sentences instead. Try "Rewrite blurbs".</span>` : ''}
+${fallback ? `<br><span class="warn">${fallback} blurb${fallback === 1 ? '' : 's'} couldn't be AI-written and used the first sentences instead. Try "Rewrite blurbs". (${esc(items.find(x => x.blurbError)?.blurbError || '')})</span>` : ''}
 You can edit any text after pasting.</p>
 <div class="email">${html}</div>
 <textarea id="src" style="position:absolute;left:-9999px">${esc(html)}</textarea>
