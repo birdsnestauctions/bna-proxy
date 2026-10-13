@@ -225,10 +225,14 @@ async function runQueue() {
   working = false;
 }
 
+const edited = new Set();        // keys whose blurb was typed/edited by hand
+const lastSeen = new Map();      // auction id -> { key, a, story } from the latest build
+
 function blurbFor(a, story, refresh) {
   const key = a.id + ':' + crypto.createHash('sha1').update(story).digest('hex');
-  if (refresh) { blurbCache.delete(key); blurbErrors.delete(key); }
-  if (blurbCache.has(key)) return { blurb: blurbCache.get(key), status: 'ai' };
+  lastSeen.set(String(a.id), { key, a, story });
+  if (refresh && !edited.has(key)) { blurbCache.delete(key); blurbErrors.delete(key); } // "Rewrite all" keeps hand edits
+  if (blurbCache.has(key)) return { blurb: blurbCache.get(key), status: edited.has(key) ? 'edited' : 'ai' };
   const failed = blurbErrors.get(key);
   if (!failed || refresh) enqueue(key, a, story);
   return { blurb: firstSentences(story, 2), status: queued.has(key) ? 'writing' : 'failed', error: failed || null };
@@ -265,7 +269,7 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
       timer: `${PUBLIC_URL}/timer?end=${stamp}`,
       tag: upcoming && opensMs ? `Opens ${shortDay(opensMs)}` : closingSoon ? 'Closing soon!' : '',
       blurb,
-      blurbStatus: status,            // 'ai' | 'writing' | 'failed'
+      blurbStatus: status,            // 'ai' | 'edited' | 'writing' | 'failed'
       ...(error ? { blurbError: error } : {}),
     };
   });
@@ -274,7 +278,7 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
 // ---------- email HTML ----------
 // Two columns that sit side by side on desktop and stack on phones,
 // using inline-block (no media queries needed) plus Outlook ghost tables.
-function cardHtml(x) {
+function cardHtml(x, editable) {
   const details = [x.lotCount ? `${x.lotCount} lots` : '', x.pickup && x.town ? `Pickup ${x.pickup} in ${x.town}` : x.town].filter(Boolean).join(' &nbsp;·&nbsp; ');
   return `
 <!-- ${esc(x.title)} -->
@@ -294,7 +298,7 @@ function cardHtml(x) {
         <p style="margin:0 0 10px 0;font-size:20px;line-height:26px;font-weight:bold;color:${C.text};"><a href="${esc(x.url)}" target="_blank" style="color:${C.text};text-decoration:none;">${esc(x.title)}</a></p>
         <p style="margin:0 0 4px 0;font-size:15px;line-height:21px;font-weight:bold;">Closes on ${esc(x.closesLabel)}</p>
         ${details ? `<p style="margin:0 0 12px 0;font-size:13px;line-height:19px;color:${C.muted};">${details}</p>` : ''}
-        <p style="margin:0 0 16px 0;font-size:15px;line-height:22px;">${esc(x.blurb)}</p>
+        <p style="margin:0 0 16px 0;font-size:15px;line-height:22px;"${editable ? ` data-blurb="${esc(x.id)}" data-status="${esc(x.blurbStatus)}"` : ''}>${esc(x.blurb)}</p>
         <table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td style="border-radius:4px;background:${C.teal};">
           <a href="${esc(x.url)}" target="_blank" style="display:inline-block;padding:11px 22px;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:bold;color:#ffffff;text-decoration:none;border-radius:4px;">View Auction</a>
         </td></tr></table>
@@ -305,24 +309,24 @@ function cardHtml(x) {
 </table>`;
 }
 
-function sectionHtml(items) {
+function sectionHtml(items, editable = false) {
   return `<!-- BNA Current Auctions — generated ${new Date().toISOString()} -->
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:580px;margin:0 auto;border-collapse:collapse;">
   <tr><td style="padding:8px 10px 20px 10px;font-family:Arial,Helvetica,sans-serif;font-size:26px;font-weight:bold;color:#000000;">Current Auctions</td></tr>
-  <tr><td>${items.map(cardHtml).join('\n')}</td></tr>
+  <tr><td>${items.map(x => cardHtml(x, editable)).join('\n')}</td></tr>
 </table>`;
 }
 
 // ---------- preview page ----------
-function previewPage(items, html) {
+function previewPage(items) {
+  const html = sectionHtml(items, true);
   const writing = items.filter(x => x.blurbStatus === 'writing').length;
   const failed = items.filter(x => x.blurbStatus === 'failed');
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-${writing ? '<meta http-equiv="refresh" content="15">' : ''}
 <title>Newsletter Auctions</title>
 <style>
   body{margin:0;background:#f4f2ee;font-family:Arial,Helvetica,sans-serif;color:#1a1a1a}
-  .bar{position:sticky;top:0;z-index:2;background:#2D6B5E;color:#fff;padding:12px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .bar{position:sticky;top:0;z-index:5;background:#2D6B5E;color:#fff;padding:12px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   .bar b{font-size:16px;margin-right:auto}
   .bar button,.bar a{background:#fff;color:#2D6B5E;border:0;border-radius:6px;padding:9px 14px;font-weight:bold;font-size:14px;cursor:pointer;text-decoration:none}
   .bar button.primary{background:#E8806B;color:#fff}
@@ -330,23 +334,106 @@ ${writing ? '<meta http-equiv="refresh" content="15">' : ''}
   .warn{color:#a4372a;font-weight:bold}
   .busy{color:#2D6B5E;font-weight:bold}
   .email{max-width:600px;margin:12px auto 40px;background:#fff;padding:24px 10px}
+  [data-blurb]{outline:1px dashed #b9c9c4;outline-offset:4px;border-radius:2px;cursor:text}
+  [data-blurb]:hover{outline-color:#2D6B5E}
+  [data-blurb]:focus{outline:2px solid #2D6B5E;background:#f3f8f6}
+  .bna-tools{display:flex;gap:8px;align-items:center;margin:-8px 0 14px 0;font:12px Arial,Helvetica,sans-serif;color:#666}
+  .bna-tools button{border:1px solid #2D6B5E;background:#fff;color:#2D6B5E;border-radius:5px;padding:4px 9px;font:bold 12px Arial,Helvetica,sans-serif;cursor:pointer}
+  .bna-tools button:disabled{opacity:.5;cursor:wait}
+  .chip{padding:2px 7px;border-radius:9px;background:#eef3f1;color:#2D6B5E;font-weight:bold}
+  .chip.edited{background:#fdeee9;color:#b5543f}
+  .chip.writing{background:#fff6dd;color:#8a6300}
+  .chip.failed{background:#fbe4e1;color:#a4372a}
 </style></head><body>
 <div class="bar"><b>Current Auctions · ${items.length} auction${items.length === 1 ? '' : 's'}</b>
   <button class="primary" id="copy">Copy HTML</button>
-  <a href="?refresh=1" onclick="this.textContent='Rewriting…'">Rewrite blurbs</a>
+  <a href="?refresh=1" id="rewriteAll">Rewrite all blurbs</a>
 </div>
-<p class="note">Paste into a <b>Code</b> element in your EmailOctopus newsletter, replacing the old Current Auctions section. Timers update on every open.
-${writing ? `<br><span class="busy">Writing ${writing} blurb${writing === 1 ? '' : 's'}… this page updates itself every 15 seconds. Wait for this message to go away before copying.</span>` : ''}
-${failed.length ? `<br><span class="warn">${failed.length} blurb${failed.length === 1 ? '' : 's'} couldn't be AI-written, so ${failed.length === 1 ? 'it uses' : 'they use'} the first sentences of the BidPath description. Try "Rewrite blurbs". (${esc(failed[0].blurbError || '')})</span>` : ''}
-You can edit any text after pasting.</p>
-<div class="email">${html}</div>
-<textarea id="src" style="position:absolute;left:-9999px">${esc(html)}</textarea>
+<p class="note"><b>Click any blurb to edit it</b> — changes save automatically. Use ↻ to get a new AI version of just that one.
+"Rewrite all blurbs" leaves your hand edits alone. Then copy and paste into a <b>Code</b> element in EmailOctopus.
+${writing ? `<br><span class="busy">Writing ${writing} blurb${writing === 1 ? '' : 's'}… this page updates itself. Wait for this message to go away before copying.</span>` : ''}
+${failed.length ? `<br><span class="warn">${failed.length} blurb${failed.length === 1 ? '' : 's'} couldn't be AI-written, so ${failed.length === 1 ? 'it uses' : 'they use'} the first sentences of the BidPath description. Edit it, or try ↻. (${esc(failed[0].blurbError || '')})</span>` : ''}
+</p>
+<div class="email" id="email">${html}</div>
+<textarea id="src" style="position:absolute;left:-9999px" aria-hidden="true"></textarea>
 <script>
+const LABEL = { ai: 'AI', edited: 'Edited', writing: 'Writing…', failed: 'Not AI' };
+const timers = {}; let saving = 0;
+
+function setChip(p, status) {
+  p.dataset.status = status;
+  const chip = p.nextElementSibling.querySelector('.chip');
+  chip.className = 'chip ' + status; chip.textContent = LABEL[status] || status;
+}
+
+async function save(p) {
+  saving++;
+  try {
+    const r = await fetch('/newsletter/blurb/' + p.dataset.blurb, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: p.innerText.trim() }) });
+    const j = await r.json();
+    if (j.status) setChip(p, j.status);
+    if (j.blurb && !p.innerText.trim()) p.innerText = j.blurb;
+  } catch (e) { alert('Could not save that edit: ' + e.message); }
+  finally { saving--; }
+}
+
+async function rewrite(p, btn) {
+  btn.disabled = true; btn.textContent = 'Writing…';
+  try {
+    const r = await fetch('/newsletter/blurb/' + p.dataset.blurb + '/rewrite', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    p.innerText = j.blurb; setChip(p, 'ai');
+  } catch (e) { alert('Could not rewrite this blurb: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = '↻ New version'; }
+}
+
+document.querySelectorAll('[data-blurb]').forEach(p => {
+  p.contentEditable = 'plaintext-only';
+  if (p.contentEditable !== 'plaintext-only') p.contentEditable = 'true';
+  p.spellcheck = true;
+  const tools = document.createElement('div');
+  tools.className = 'bna-tools';
+  tools.innerHTML = '<span class="chip"></span><button type="button">↻ New version</button>';
+  p.after(tools);
+  setChip(p, p.dataset.status);
+  tools.querySelector('button').onclick = () => rewrite(p, tools.querySelector('button'));
+  p.addEventListener('input', () => { clearTimeout(timers[p.dataset.blurb]); timers[p.dataset.blurb] = setTimeout(() => save(p), 800); });
+  p.addEventListener('blur', () => { clearTimeout(timers[p.dataset.blurb]); save(p); });
+  p.addEventListener('paste', e => { e.preventDefault(); document.execCommand('insertText', false, (e.clipboardData || window.clipboardData).getData('text/plain')); });
+});
+
+// Clean email HTML: the page's markup minus the editing helpers.
+function cleanHtml() {
+  const clone = document.getElementById('email').cloneNode(true);
+  clone.querySelectorAll('.bna-tools').forEach(n => n.remove());
+  clone.querySelectorAll('[data-blurb]').forEach(n => {
+    const text = n.innerText.trim();
+    ['data-blurb', 'data-status', 'contenteditable', 'spellcheck'].forEach(a => n.removeAttribute(a));
+    n.textContent = text;
+  });
+  return clone.innerHTML.trim();
+}
+
 document.getElementById('copy').onclick = async function () {
-  const t = document.getElementById('src').value;
-  try { await navigator.clipboard.writeText(t); } catch (e) { const s = document.getElementById('src'); s.select(); document.execCommand('copy'); }
+  const t = cleanHtml();
+  try { await navigator.clipboard.writeText(t); }
+  catch (e) { const s = document.getElementById('src'); s.value = t; s.select(); document.execCommand('copy'); }
   this.textContent = 'Copied!'; setTimeout(() => this.textContent = 'Copy HTML', 2000);
 };
+
+document.getElementById('rewriteAll').onclick = function (e) {
+  if (!confirm('Get new AI versions of every blurb you haven\\'t edited by hand?')) { e.preventDefault(); return; }
+  this.textContent = 'Rewriting…';
+};
+
+// While blurbs are being written, reload to pick them up — but never while you're typing.
+${writing ? `setInterval(() => {
+  const typing = document.activeElement && document.activeElement.matches('[data-blurb]');
+  if (!typing && !saving && !Object.values(timers).length) location.reload();
+}, 15000);
+document.addEventListener('focusin', () => Object.keys(timers).forEach(k => delete timers[k]));` : ''}
 </script></body></html>`;
 }
 
@@ -365,8 +452,41 @@ function register(app, integrationKey) {
   app.get('/newsletter/auctions.html', handle((req, res, items) => res.type('html').set('Cache-Control', 'no-store').send(sectionHtml(items))));
   app.get('/newsletter', handle((req, res, items) => {
     if (req.query.refresh === '1') return res.redirect('/newsletter'); // blurbs are re-queued; don't keep ?refresh in the URL
-    res.type('html').set('Cache-Control', 'no-store').send(previewPage(items, sectionHtml(items)));
+    res.type('html').set('Cache-Control', 'no-store').send(previewPage(items));
   }));
+
+  // Save a hand-edited blurb (empty text = go back to AI)
+  app.post('/newsletter/blurb/:id', (req, res) => {
+    const seen = lastSeen.get(req.params.id);
+    if (!seen) return res.status(404).json({ error: 'Unknown auction — reload the page' });
+    const text = String(req.body?.text || '').trim();
+    if (!text) {
+      edited.delete(seen.key); blurbCache.delete(seen.key); blurbErrors.delete(seen.key);
+      enqueue(seen.key, seen.a, seen.story);
+      return res.json({ status: 'writing', blurb: firstSentences(seen.story, 2) });
+    }
+    if (blurbCache.get(seen.key) === text && edited.has(seen.key)) return res.json({ status: 'edited' });
+    if (blurbCache.get(seen.key) === text) return res.json({ status: edited.has(seen.key) ? 'edited' : 'ai' });
+    blurbCache.set(seen.key, text);
+    edited.add(seen.key);
+    blurbErrors.delete(seen.key);
+    res.json({ status: 'edited' });
+  });
+
+  // New AI version of one blurb (waits for it)
+  app.post('/newsletter/blurb/:id/rewrite', async (req, res) => {
+    const seen = lastSeen.get(req.params.id);
+    if (!seen) return res.status(404).json({ error: 'Unknown auction — reload the page' });
+    try {
+      const blurb = await writeBlurb(seen.a, seen.story);
+      blurbCache.set(seen.key, blurb);
+      edited.delete(seen.key);
+      blurbErrors.delete(seen.key);
+      res.json({ blurb, status: 'ai' });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
 }
 
 module.exports = { register, buildFeed, sectionHtml, previewPage, auctionStory, closeLabel, easternStamp, pickupDay, titleCaseTown };
