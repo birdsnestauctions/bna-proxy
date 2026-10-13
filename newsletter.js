@@ -42,7 +42,7 @@ async function fetchAuctions(integrationKey) {
 const ENTITIES = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", ldquo: '“', rdquo: '”', lsquo: '‘', rsquo: '’', mdash: '—', ndash: '–', hellip: '…', eacute: 'é', deg: '°' };
 function htmlToText(html) {
   return String(html || '')
-    .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/li>/gi, '\n')
+    .replace(/<br\s*\/?>|<\/(?:p|div|li|h[1-6])>/gi, '\n')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
@@ -57,7 +57,10 @@ function auctionStory(descriptionHtml) {
   return htmlToText(descriptionHtml)
     .split('\n')
     .filter(line => !/pick ?-?up|we ship|shipping fulfil+ment|search for .?shipping|picked up within/i.test(line))
-    .filter(line => !(line.replace(/[^A-Za-z]/g, '').length > 3 && line === line.toUpperCase())) // ALL-CAPS address/date headers
+    .filter(line => { // ALL-CAPS address/date headers ("THURSDAY OCTOBER 22nd 10-3PM")
+      const letters = line.replace(/[^A-Za-z]/g, '');
+      return !(letters.length > 3 && letters.replace(/[^A-Z]/g, '').length / letters.length >= 0.8);
+    })
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -145,16 +148,46 @@ VOICE RULES — follow these strictly:
 - Return only the blurb text, no headers, no quotes, no formatting`;
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// If ANTHROPIC_API_KEY is set on this service, call Anthropic directly; otherwise go through bna-claude-proxy.
+function claudeRequest(body, signal) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  return key
+    ? fetch('https://api.anthropic.com/v1/messages', { method: 'POST', signal, body,
+        headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' } })
+    : fetch(CLAUDE_PROXY, { method: 'POST', signal, body, headers: { 'Content-Type': 'application/json' } });
+}
+
+// Retries "busy" answers (429 / 5xx) with a growing wait.
 async function writeBlurb(a, story) {
+  const body = JSON.stringify({ model: BLURB_MODEL, max_tokens: 400, messages: [{ role: 'user', content: blurbPrompt(a, story) }] });
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return await writeBlurbOnce(body);
+    } catch (err) {
+      lastErr = err;
+      if (!err.retryable) break;
+      const wait = (err.retryAfter || 4 * 2 ** attempt) * 1000;
+      console.warn(`Blurb for auction ${a.id} busy (${err.message}); retrying in ${wait / 1000}s`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
+async function writeBlurbOnce(body) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 60000);
   try {
-    const r = await fetch(CLAUDE_PROXY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: BLURB_MODEL, max_tokens: 400, messages: [{ role: 'user', content: blurbPrompt(a, story) }] }),
-      signal: ctrl.signal,
-    });
+    const r = await claudeRequest(body, ctrl.signal);
+    if (r.status === 429 || r.status >= 500) {
+      const e = new Error(`Claude ${r.status}: ${(await r.text()).trim().slice(0, 120)}`);
+      e.retryable = true;
+      e.retryAfter = Number(r.headers.get('retry-after')) || 0;
+      throw e;
+    }
     const raw = await r.text();
     let data; try { data = JSON.parse(raw); } catch { throw new Error(`Claude proxy ${r.status}: ${raw.slice(0, 200)}`); }
     const text = data?.content?.[0]?.text?.trim();
@@ -167,7 +200,7 @@ async function writeBlurb(a, story) {
 
 async function getBlurb(a, story, refresh) {
   const key = a.id + ':' + crypto.createHash('sha1').update(story).digest('hex');
-  if (!refresh && blurbCache.has(key)) return blurbCache.get(key);
+  if (!refresh && blurbCache.has(key)) return { ...blurbCache.get(key), fresh: false };
   let blurb, ai = true, error = null;
   try {
     blurb = await writeBlurb(a, story);
@@ -179,7 +212,7 @@ async function getBlurb(a, story, refresh) {
   }
   const result = { blurb, ai, error };
   if (ai) blurbCache.set(key, result); // don't cache fallbacks; try AI again next time
-  return result;
+  return { ...result, fresh: true };
 }
 
 // ---------- build the feed ----------
@@ -192,9 +225,17 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
     .filter(x => x.closeMs > now)
     .sort((x, y) => x.closeMs - y.closeMs);
 
-  return Promise.all(live.map(async ({ a, closeMs }) => {
+  // Blurbs one at a time — the Claude proxy rejects bursts of parallel requests.
+  const blurbs = [];
+  for (const { a } of live) {
     const story = auctionStory(a.info.description);
-    const { blurb, ai, error } = await getBlurb(a, story, refresh);
+    const b = await getBlurb(a, story, refresh);
+    blurbs.push(b);
+    if (b.fresh) await sleep(300);
+  }
+
+  return live.map(({ a, closeMs }, i) => {
+    const { blurb, ai, error } = blurbs[i];
     const opensMs = Date.parse(a.auctionSchedule.biddingStartDate || '') || null;
     const upcoming = a.info.progressStatus === 'UPCOMING' || (opensMs && opensMs > now);
     const closingSoon = !upcoming && closeMs - now <= CLOSING_SOON_HOURS * 3600 * 1000;
@@ -215,7 +256,7 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
       blurbIsAI: ai,
       ...(error ? { blurbError: error } : {}),
     };
-  }));
+  });
 }
 
 // ---------- email HTML ----------
