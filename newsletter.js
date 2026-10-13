@@ -159,27 +159,21 @@ function claudeRequest(body, signal) {
     : fetch(CLAUDE_PROXY, { method: 'POST', signal, body, headers: { 'Content-Type': 'application/json' } });
 }
 
-// Retries "busy" answers (429 / 5xx) with a growing wait.
+// Retries "busy" answers (429 / 5xx) once.
 async function writeBlurb(a, story) {
   const body = JSON.stringify({ model: BLURB_MODEL, max_tokens: 400, messages: [{ role: 'user', content: blurbPrompt(a, story) }] });
-  let lastErr;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      return await writeBlurbOnce(body);
-    } catch (err) {
-      lastErr = err;
-      if (!err.retryable) break;
-      const wait = (err.retryAfter || 4 * 2 ** attempt) * 1000;
-      console.warn(`Blurb for auction ${a.id} busy (${err.message}); retrying in ${wait / 1000}s`);
-      await sleep(wait);
-    }
+  try {
+    return await writeBlurbOnce(body);
+  } catch (err) {
+    if (!err.retryable) throw err;
+    await sleep((err.retryAfter || 8) * 1000);
+    return writeBlurbOnce(body);
   }
-  throw lastErr;
 }
 
 async function writeBlurbOnce(body) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 60000);
+  const timer = setTimeout(() => ctrl.abort(), 45000);
   try {
     const r = await claudeRequest(body, ctrl.signal);
     if (r.status === 429 || r.status >= 500) {
@@ -189,30 +183,55 @@ async function writeBlurbOnce(body) {
       throw e;
     }
     const raw = await r.text();
-    let data; try { data = JSON.parse(raw); } catch { throw new Error(`Claude proxy ${r.status}: ${raw.slice(0, 200)}`); }
+    let data; try { data = JSON.parse(raw); } catch { throw new Error(`Claude ${r.status}: ${raw.slice(0, 200)}`); }
     const text = data?.content?.[0]?.text?.trim();
-    if (!text) throw new Error(`Claude proxy ${r.status}: ${data?.error?.message || JSON.stringify(data).slice(0, 200)}`);
+    if (!text) throw new Error(`Claude ${r.status}: ${data?.error?.message || JSON.stringify(data).slice(0, 200)}`);
     return text.replace(/^["“]|["”]$/g, '').trim();
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Timed out waiting for Claude');
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function getBlurb(a, story, refresh) {
-  const key = a.id + ':' + crypto.createHash('sha1').update(story).digest('hex');
-  if (!refresh && blurbCache.has(key)) return { ...blurbCache.get(key), fresh: false };
-  let blurb, ai = true, error = null;
-  try {
-    blurb = await writeBlurb(a, story);
-  } catch (err) {
-    console.error(`Blurb failed for auction ${a.id}:`, err.message);
-    blurb = firstSentences(story, 2);
-    ai = false;
-    error = err.name === 'AbortError' ? 'Timed out waiting for the Claude proxy' : err.message;
+// Blurbs are written in the background, one at a time, so pages never wait on AI.
+const blurbErrors = new Map();   // key -> last error message
+const queue = [];                // [{ key, a, story }]
+const queued = new Set();
+let working = false;
+
+function enqueue(key, a, story) {
+  if (queued.has(key)) return;
+  queued.add(key);
+  queue.push({ key, a, story });
+  if (!working) runQueue();
+}
+
+async function runQueue() {
+  working = true;
+  while (queue.length) {
+    const { key, a, story } = queue.shift();
+    try {
+      blurbCache.set(key, await writeBlurb(a, story));
+      blurbErrors.delete(key);
+    } catch (err) {
+      console.error(`Blurb failed for auction ${a.id}:`, err.message);
+      blurbErrors.set(key, err.message);
+    }
+    queued.delete(key);
+    await sleep(1000);
   }
-  const result = { blurb, ai, error };
-  if (ai) blurbCache.set(key, result); // don't cache fallbacks; try AI again next time
-  return { ...result, fresh: true };
+  working = false;
+}
+
+function blurbFor(a, story, refresh) {
+  const key = a.id + ':' + crypto.createHash('sha1').update(story).digest('hex');
+  if (refresh) { blurbCache.delete(key); blurbErrors.delete(key); }
+  if (blurbCache.has(key)) return { blurb: blurbCache.get(key), status: 'ai' };
+  const failed = blurbErrors.get(key);
+  if (!failed || refresh) enqueue(key, a, story);
+  return { blurb: firstSentences(story, 2), status: queued.has(key) ? 'writing' : 'failed', error: failed || null };
 }
 
 // ---------- build the feed ----------
@@ -225,17 +244,10 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
     .filter(x => x.closeMs > now)
     .sort((x, y) => x.closeMs - y.closeMs);
 
-  // Blurbs one at a time — the Claude proxy rejects bursts of parallel requests.
-  const blurbs = [];
-  for (const { a } of live) {
-    const story = auctionStory(a.info.description);
-    const b = await getBlurb(a, story, refresh);
-    blurbs.push(b);
-    if (b.fresh) await sleep(300);
-  }
+  const blurbs = live.map(({ a }) => blurbFor(a, auctionStory(a.info.description), refresh));
 
   return live.map(({ a, closeMs }, i) => {
-    const { blurb, ai, error } = blurbs[i];
+    const { blurb, status, error } = blurbs[i];
     const opensMs = Date.parse(a.auctionSchedule.biddingStartDate || '') || null;
     const upcoming = a.info.progressStatus === 'UPCOMING' || (opensMs && opensMs > now);
     const closingSoon = !upcoming && closeMs - now <= CLOSING_SOON_HOURS * 3600 * 1000;
@@ -253,7 +265,7 @@ async function buildFeed(integrationKey, { refresh = false } = {}) {
       timer: `${PUBLIC_URL}/timer?end=${stamp}`,
       tag: upcoming && opensMs ? `Opens ${shortDay(opensMs)}` : closingSoon ? 'Closing soon!' : '',
       blurb,
-      blurbIsAI: ai,
+      blurbStatus: status,            // 'ai' | 'writing' | 'failed'
       ...(error ? { blurbError: error } : {}),
     };
   });
@@ -303,8 +315,10 @@ function sectionHtml(items) {
 
 // ---------- preview page ----------
 function previewPage(items, html) {
-  const fallback = items.filter(x => !x.blurbIsAI).length;
+  const writing = items.filter(x => x.blurbStatus === 'writing').length;
+  const failed = items.filter(x => x.blurbStatus === 'failed');
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+${writing ? '<meta http-equiv="refresh" content="15">' : ''}
 <title>Newsletter Auctions</title>
 <style>
   body{margin:0;background:#f4f2ee;font-family:Arial,Helvetica,sans-serif;color:#1a1a1a}
@@ -314,6 +328,7 @@ function previewPage(items, html) {
   .bar button.primary{background:#E8806B;color:#fff}
   .note{max-width:600px;margin:12px auto 0;padding:0 16px;font-size:13px;color:#555;line-height:1.5}
   .warn{color:#a4372a;font-weight:bold}
+  .busy{color:#2D6B5E;font-weight:bold}
   .email{max-width:600px;margin:12px auto 40px;background:#fff;padding:24px 10px}
 </style></head><body>
 <div class="bar"><b>Current Auctions · ${items.length} auction${items.length === 1 ? '' : 's'}</b>
@@ -321,7 +336,8 @@ function previewPage(items, html) {
   <a href="?refresh=1" onclick="this.textContent='Rewriting…'">Rewrite blurbs</a>
 </div>
 <p class="note">Paste into a <b>Code</b> element in your EmailOctopus newsletter, replacing the old Current Auctions section. Timers update on every open.
-${fallback ? `<br><span class="warn">${fallback} blurb${fallback === 1 ? '' : 's'} couldn't be AI-written and used the first sentences instead. Try "Rewrite blurbs". (${esc(items.find(x => x.blurbError)?.blurbError || '')})</span>` : ''}
+${writing ? `<br><span class="busy">Writing ${writing} blurb${writing === 1 ? '' : 's'}… this page updates itself every 15 seconds. Wait for this message to go away before copying.</span>` : ''}
+${failed.length ? `<br><span class="warn">${failed.length} blurb${failed.length === 1 ? '' : 's'} couldn't be AI-written, so ${failed.length === 1 ? 'it uses' : 'they use'} the first sentences of the BidPath description. Try "Rewrite blurbs". (${esc(failed[0].blurbError || '')})</span>` : ''}
 You can edit any text after pasting.</p>
 <div class="email">${html}</div>
 <textarea id="src" style="position:absolute;left:-9999px">${esc(html)}</textarea>
@@ -347,7 +363,10 @@ function register(app, integrationKey) {
   };
   app.get('/feed/auctions', handle((req, res, items) => res.set('Cache-Control', 'no-store').json({ items })));
   app.get('/newsletter/auctions.html', handle((req, res, items) => res.type('html').set('Cache-Control', 'no-store').send(sectionHtml(items))));
-  app.get('/newsletter', handle((req, res, items) => res.type('html').set('Cache-Control', 'no-store').send(previewPage(items, sectionHtml(items)))));
+  app.get('/newsletter', handle((req, res, items) => {
+    if (req.query.refresh === '1') return res.redirect('/newsletter'); // blurbs are re-queued; don't keep ?refresh in the URL
+    res.type('html').set('Cache-Control', 'no-store').send(previewPage(items, sectionHtml(items)));
+  }));
 }
 
 module.exports = { register, buildFeed, sectionHtml, previewPage, auctionStory, closeLabel, easternStamp, pickupDay, titleCaseTown };
