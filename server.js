@@ -40,6 +40,9 @@ app.post('/graphql', async (req, res) => {
 app.get('/timer', timerHandler);
 app.get('/timer.gif', timerHandler);
 
+// Newsletter "Current Auctions" section built from BidPath: /newsletter
+require('./newsletter').register(app, INTEGRATION_KEY);
+
 app.get('/', (req, res) => res.send('BNA proxy running.'));
 
 app.listen(PORT, () => console.log(`Proxy listening on port ${PORT}`));
