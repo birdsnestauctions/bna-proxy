@@ -43,6 +43,9 @@ app.get('/timer.gif', timerHandler);
 // Newsletter "Current Auctions" section built from BidPath: /newsletter
 require('./newsletter').register(app, INTEGRATION_KEY);
 
+// Client payout portal API: /payouts/api/*
+require('./payouts').register(app, INTEGRATION_KEY);
+
 app.get('/', (req, res) => res.send('BNA proxy running.'));
 
 app.listen(PORT, () => console.log(`Proxy listening on port ${PORT}`));
