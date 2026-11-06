@@ -157,14 +157,19 @@ async function syncSale(body, sess, key) {
 
   // Invoices are optional: they add buyer balances, refund notes, and catch refunds made before the portal saw the sale.
   let invoiceAccess = true, owed = 0;
-  const invLine = {}, notes = {};
+  const invLine = {}, notes = {}, lotInvStatus = {};
   const inv = await fetchAll(o => invoicesQuery(id, o), j => j?.data?.legacyInvoices, sess.b, key);
   if (denied(inv.json) && !inv.rows.length) invoiceAccess = false;
   inv.rows.forEach(v => {
     if (v.status !== 'CANCELED') owed += Number(v.totals?.balanceDue) || 0;
     (v.lineItems || []).forEach(li => {
       const n = li?.auctionLot?.info?.lotNo;
-      if (n != null) invLine[String(n)] = Number(li.hammerPrice) || 0;
+      if (n == null) return;
+      const k = String(n);
+      // A lot can sit on a canceled invoice and then be re-sold on another; the live invoice wins.
+      if (v.status === 'CANCELED' && lotInvStatus[k] && lotInvStatus[k] !== 'CANCELED') return;
+      invLine[k] = Number(li.hammerPrice) || 0;
+      lotInvStatus[k] = v.status;
     });
     parseNotes(v.internalNote).forEach(x => { notes[x.lotNo] = (notes[x.lotNo] ? notes[x.lotNo] + '\n' : '') + x.note; });
   });
@@ -221,8 +226,13 @@ async function syncSale(body, sess, key) {
         id: `${id}-${lotNo}`, auctionId: id, saleName: auction.info.name, lotNo, itemName: item.name || '',
         kind, origPrice: closePrice, newPrice, invoiceNote: notes[lotNo] || (a ? a.invoiceNote : ''),
       };
+      const neverPaid = kind === 'full' && lotInvStatus[lotNo] === 'CANCELED';
       if (!a || a.status === 'void') Object.assign(row, { status: 'open', detectedAt: now });
       else if (Number(a.newPrice) !== newPrice || a.kind !== kind) Object.assign(row, { status: 'open', decidedBy: '', decidedAt: '' });
+      // The buyer's invoice was canceled: nothing was collected, so it's not a refund and the client isn't paid.
+      if (neverPaid && (row.status === 'open' || (a && a.status === 'open'))) {
+        Object.assign(row, { status: 'classified', reason: 'unpaid', clientPaid: 'false', decidedBy: 'Auto: invoice canceled', decidedAt: now });
+      }
       adjRows.push(row);
     } else if (a && a.status !== 'void') {
       adjRows.push({ id: a.id, auctionId: id, lotNo, status: 'void' }); // price was put back
@@ -245,7 +255,7 @@ async function syncSale(body, sess, key) {
   const np = Object.values(newPayees);
   if (np.length) await sheet('upsert', { tab: 'Payees', rows: np, user: sess.u });
 
-  return { synced: lotRows.length, newRefunds: adjRows.filter(r => r.status === 'open').length, invoiceAccess, closed: isClosed };
+  return { synced: lotRows.length, newRefunds: adjRows.filter(r => r.status === 'open').length, neverPaid: adjRows.filter(r => r.reason === 'unpaid').length, invoiceAccess, closed: isClosed };
 }
 
 // ---------- routes ----------
