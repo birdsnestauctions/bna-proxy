@@ -48,7 +48,7 @@ function verify(token) {
 function allowed(user) {
   const email = String(user.email || '').toLowerCase();
   const name = String(user.username || '').toLowerCase();
-  if (email.endsWith('@birdsnestauctions.com')) return true;
+  if (email.endsWith('@birdsnestauctions.com') || name.endsWith('@birdsnestauctions.com')) return true;
   const list = env('PORTAL_USERS').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
   return list.includes(email) || list.includes(name);
 }
