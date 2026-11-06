@@ -84,10 +84,10 @@ async function sheet(op, payload = {}) {
 }
 
 const WRITABLE = {
-  Sales: ['auctionId', 'type', 'clientName', 'clientEmail', 'stage', 'soldTotal', 'estPayout', 'checks', 'openCount'],
+  Sales: ['auctionId', 'name', 'presaleName', 'assettraxNo', 'photoDate', 'type', 'clientName', 'clientEmail', 'stage', 'soldTotal', 'estPayout', 'feeTotal', 'checks', 'openCount'],
   Payees: ['auctionId', 'payeeKey', 'name', 'email', 'rate', 'rateReason', 'payout', 'printed', 'checkNo', 'mailedOn', 'emailed', 'paidAt', 'paidBy'],
-  Lots: ['auctionId', 'lotNo', 'gsOverride', 'payeeOverride', 'note'],
-  Fees: ['id', 'auctionId', 'payeeKey', 'label', 'amount', 'note', 'addedBy', 'addedAt'],
+  Lots: ['auctionId', 'lotNo', 'gsOverride', 'lotRate', 'payeeOverride', 'note'],
+  Fees: ['id', 'auctionId', 'payeeKey', 'kind', 'label', 'qty', 'lotNo', 'itemName', 'minimum', 'amount', 'note', 'addedBy', 'addedAt'],
   Adjustments: ['id', 'auctionId', 'reason', 'text', 'clientPaid', 'highValueOk', 'fix', 'fixDone', 'status', 'decidedBy', 'decidedAt'],
 };
 function clean(tab, rows) {
@@ -150,6 +150,7 @@ async function syncSale(body, sess, key) {
     ... on TimedAuction { auctionSchedule { endDate } } } }`, sess.b, key);
   const auction = info?.data?.auction;
   if (!auction) throw httpError(404, `BidPath has no auction ${id}.`);
+  const isClosed = auction.info.progressStatus === 'CLOSED';
 
   const lotsRes = await fetchAll(o => lotsQuery(id, o, consignorField), j => j?.data?.auctionLots, sess.b, key);
   if (!lotsRes.rows.length && lotsRes.json.errors) throw httpError(502, `BidPath: ${lotsRes.json.errors[0].message}`);
@@ -189,9 +190,11 @@ async function syncSale(body, sess, key) {
 
     // Snapshot the sold price the first time the portal sees the lot. If the invoice shows a higher
     // price (or the lot was sold but is now unsold), the refund happened before the portal: use the invoice.
-    let closeStatus = prev ? prev.closeStatus : status;
-    let closePrice = prev ? Number(prev.closePrice) || 0 : price;
-    if (!prev && onInvoice && (invLine[lotNo] > price || status !== 'SOLD')) { closeStatus = 'SOLD'; closePrice = invLine[lotNo]; }
+    // While the auction is live there is no snapshot yet: bids are not final.
+    const hasSnap = prev && prev.closeStatus !== '' && prev.closeStatus != null;
+    let closeStatus = hasSnap ? prev.closeStatus : (isClosed ? status : '');
+    let closePrice = hasSnap ? Number(prev.closePrice) || 0 : (isClosed ? price : '');
+    if (!hasSnap && isClosed && onInvoice && (invLine[lotNo] > price || status !== 'SOLD')) { closeStatus = 'SOLD'; closePrice = invLine[lotNo]; }
 
     lotRows.push({
       auctionId: id, lotNo, lotItemId: item.id, name: item.name || '', category: (item.categories || [])[0]?.name || '',
@@ -209,7 +212,8 @@ async function syncSale(body, sess, key) {
 
     // Refund detection against the snapshot.
     let kind = null, newPrice = price;
-    if (closeStatus === 'SOLD' && status !== 'SOLD') { kind = 'full'; newPrice = 0; }
+    if (!isClosed) { /* no refund detection until the sale closes */ }
+    else if (closeStatus === 'SOLD' && status !== 'SOLD') { kind = 'full'; newPrice = 0; }
     else if (closeStatus === 'SOLD' && price < closePrice - 0.004) kind = 'partial';
     const a = oldAdj[lotNo];
     if (kind) {
@@ -227,10 +231,11 @@ async function syncSale(body, sess, key) {
 
   const endDate = auction.auctionSchedule?.endDate || sale.closeDate || '';
   const saleRow = {
-    auctionId: id, saleNo: auction.info.saleNo, name: auction.info.name, type, closeDate: endDate,
+    auctionId: id, saleNo: auction.info.saleNo, name: auction.info.name, type, closeDate: endDate, bidpathStatus: auction.info.progressStatus,
     owedByBuyers: invoiceAccess ? Math.round(owed * 100) / 100 : '', invoiceAccess: invoiceAccess ? 'yes' : 'no', lastSync: now,
   };
   if (!stored.Sales.length) Object.assign(saleRow, { stage: 'open', createdBy: sess.u, createdAt: now });
+  else if (sale.stage === 'prep' || !sale.stage) saleRow.stage = 'open';
   if (body.clientName !== undefined) saleRow.clientName = body.clientName;
   if (body.clientEmail !== undefined) saleRow.clientEmail = body.clientEmail;
 
@@ -240,7 +245,7 @@ async function syncSale(body, sess, key) {
   const np = Object.values(newPayees);
   if (np.length) await sheet('upsert', { tab: 'Payees', rows: np, user: sess.u });
 
-  return { synced: lotRows.length, newRefunds: adjRows.filter(r => r.status === 'open').length, invoiceAccess };
+  return { synced: lotRows.length, newRefunds: adjRows.filter(r => r.status === 'open').length, invoiceAccess, closed: isClosed };
 }
 
 // ---------- routes ----------
@@ -274,21 +279,23 @@ function register(app, integrationKey) {
 
   app.get('/payouts/api/overview', wrap(async req => {
     auth(req);
-    return sheet('read', { tabs: ['Sales', 'Payees', 'Adjustments'] });
+    return sheet('read', { tabs: ['Sales', 'Payees', 'Adjustments', 'Fees'] });
   }));
 
   app.get('/payouts/api/sale/:id', wrap(async req => {
     auth(req);
-    return sheet('read', { tabs: ['Sales', 'Payees', 'Lots', 'Fees', 'Adjustments'], auctionId: parseInt(req.params.id, 10) });
+    const id = String(req.params.id || '');
+    if (!/^(\d+|P[A-Z0-9]+)$/.test(id)) throw httpError(400, 'That sale id is not valid.');
+    return sheet('read', { tabs: ['Sales', 'Payees', 'Lots', 'Fees', 'Adjustments'], auctionId: id });
   }));
 
   app.get('/payouts/api/auctions', wrap(async req => {
     const s = auth(req);
-    const json = await bidpath(`{ auctions(offset: 0, limit: 60, sort: { id: DESC }, filter: { progressStatus: [CLOSED] }) {
-      id info { name saleNo isTestAuction } ... on TimedAuction { auctionSchedule { endDate } } } }`, s.b, integrationKey);
+    const json = await bidpath(`{ auctions(offset: 0, limit: 80, sort: { id: DESC }, filter: { progressStatus: [CLOSED, IN_PROGRESS, UPCOMING] }) {
+      id info { name saleNo isTestAuction progressStatus } ... on TimedAuction { auctionSchedule { endDate } } } }`, s.b, integrationKey);
     if (!json?.data?.auctions) throw httpError(502, `BidPath: ${(json.errors || [{}])[0].message || 'no auctions returned'}`);
     return json.data.auctions.filter(a => !a.info.isTestAuction).map(a => ({
-      id: a.id, name: a.info.name, saleNo: a.info.saleNo, closeDate: a.auctionSchedule?.endDate || '',
+      id: a.id, name: a.info.name, saleNo: a.info.saleNo, status: a.info.progressStatus, closeDate: a.auctionSchedule?.endDate || '',
     }));
   }));
 
@@ -305,6 +312,49 @@ function register(app, integrationKey) {
     const { tab, row } = req.body || {};
     if (tab !== 'Fees' || !row || !row.id) throw httpError(400, 'Only fees can be removed.');
     return sheet('remove', { tab, row: { id: row.id }, user: s.u });
+  }));
+
+  // A sale that isn't in BidPath yet (photo day / editing). Gets a portal id until it's linked.
+  app.post('/payouts/api/create', wrap(async req => {
+    const s = auth(req);
+    const b = req.body || {};
+    if (!String(b.name || '').trim()) throw httpError(400, 'Give the sale a name.');
+    const id = 'P' + Date.now().toString(36).toUpperCase();
+    const now = new Date().toISOString();
+    await sheet('upsert', { tab: 'Sales', user: s.u, rows: [{
+      auctionId: id, name: b.name.trim(), presaleName: b.name.trim(), type: b.type === 'consignment' ? 'consignment' : 'estate',
+      clientName: b.clientName || '', clientEmail: b.clientEmail || '', photoDate: b.photoDate || '', assettraxNo: b.assettraxNo || '',
+      stage: 'prep', bidpathStatus: '', createdBy: s.u, createdAt: now,
+    }] });
+    return { id };
+  }));
+
+  // Connect a presale record to its BidPath auction: moves fees and details over, then pulls lots.
+  app.post('/payouts/api/link', wrap(async req => {
+    const s = auth(req);
+    const { from, auctionId } = req.body || {};
+    if (!/^P/.test(String(from || '')) || !parseInt(auctionId, 10)) throw httpError(400, 'Choose the BidPath auction to link.');
+    await sheet('rekey', { from: String(from), to: String(parseInt(auctionId, 10)), user: s.u });
+    return syncSale({ auctionId }, s, integrationKey);
+  }));
+
+  // Daily refresh for every linked, unpaid sale, so the price snapshot is taken right after close.
+  // Call: POST /payouts/api/cron with header X-Cron-Key: <PORTAL_CRON_KEY>
+  app.post('/payouts/api/cron', wrap(async req => {
+    if (!env('PORTAL_CRON_KEY') || req.headers['x-cron-key'] !== env('PORTAL_CRON_KEY')) throw httpError(401, 'Not authorized.');
+    if (!env('PORTAL_BIDPATH_USER') || !env('PORTAL_BIDPATH_PASSWORD')) throw httpError(500, 'PORTAL_BIDPATH_USER and PORTAL_BIDPATH_PASSWORD are not set on Render.');
+    const m = `mutation { auth { createToken(username: ${JSON.stringify(env('PORTAL_BIDPATH_USER'))}, password: ${JSON.stringify(env('PORTAL_BIDPATH_PASSWORD'))}) { accessToken } } }`;
+    const tok = (await bidpath(m, null, integrationKey))?.data?.auth?.createToken?.accessToken;
+    if (!tok) throw httpError(502, 'BidPath did not accept the portal login.');
+    const sess = { u: 'Morning sync', b: tok };
+    const { Sales } = await sheet('read', { tabs: ['Sales'] });
+    const due = Sales.filter(x => /^\d+$/.test(String(x.auctionId)) && x.stage !== 'paid');
+    const results = [];
+    for (const x of due) {
+      try { const r = await syncSale({ auctionId: x.auctionId }, sess, integrationKey); results.push({ sale: x.name, ...r }); }
+      catch (e) { results.push({ sale: x.name, error: e.message }); }
+    }
+    return { synced: results.length, results };
   }));
 
   app.post('/payouts/api/missive-draft', wrap(async req => {

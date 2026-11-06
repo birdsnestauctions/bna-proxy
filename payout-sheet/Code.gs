@@ -13,15 +13,15 @@
  */
 
 const TABS = {
-  Sales:       ['auctionId', 'saleNo', 'name', 'type', 'clientName', 'clientEmail', 'closeDate', 'stage',
+  Sales:       ['auctionId', 'saleNo', 'name', 'presaleName', 'assettraxNo', 'photoDate', 'bidpathStatus', 'type', 'clientName', 'clientEmail', 'closeDate', 'stage',
                 'soldTotal', 'estPayout', 'checks', 'openCount', 'owedByBuyers', 'invoiceAccess',
                 'lastSync', 'createdBy', 'createdAt', 'updatedBy', 'updatedAt'],
   Payees:      ['auctionId', 'payeeKey', 'name', 'email', 'rate', 'rateReason', 'payout',
                 'printed', 'checkNo', 'mailedOn', 'emailed', 'paidAt', 'paidBy', 'updatedBy', 'updatedAt'],
   Lots:        ['auctionId', 'lotNo', 'lotItemId', 'name', 'category', 'initials', 'consignorEmail',
-                'closeStatus', 'closePrice', 'status', 'price', 'invoicePrice', 'gsOverride', 'payeeOverride',
+                'closeStatus', 'closePrice', 'status', 'price', 'invoicePrice', 'gsOverride', 'lotRate', 'payeeOverride',
                 'note', 'lastSync'],
-  Fees:        ['id', 'auctionId', 'payeeKey', 'label', 'amount', 'note', 'addedBy', 'addedAt'],
+  Fees:        ['id', 'auctionId', 'payeeKey', 'kind', 'label', 'qty', 'lotNo', 'itemName', 'minimum', 'amount', 'note', 'addedBy', 'addedAt'],
   Adjustments: ['id', 'auctionId', 'saleName', 'lotNo', 'itemName', 'kind', 'origPrice', 'newPrice', 'status',
                 'reason', 'text', 'clientPaid', 'highValueOk', 'invoiceNote', 'fix', 'fixDone',
                 'detectedAt', 'decidedBy', 'decidedAt'],
@@ -73,6 +73,7 @@ function handle(req) {
     case 'read':      return read(req.tabs || Object.keys(KEYS), req.auctionId);
     case 'upsert':    return upsert(req.tab, req.rows || [], req.user || '');
     case 'remove':    return remove(req.tab, req.row || {}, req.user || '');
+    case 'rekey':     return rekey(String(req.from), String(req.to), req.user || '');
     default: throw new Error('Unknown op ' + req.op);
   }
 }
@@ -115,6 +116,7 @@ function keyOf(keys, o) { return keys.map(k => String(o[k])).join('|'); }
 function upsert(tab, list, user) {
   if (!KEYS[tab]) throw new Error('Tab ' + tab + ' is read-only');
   const keys = KEYS[tab];
+  addMissingColumns(tab, list);
   const { sh, head, data } = rows(tab);
   const index = {};
   data.forEach((r, i) => { index[keyOf(keys, toObj(head, r))] = i; });
@@ -161,4 +163,36 @@ function remove(tab, o, user) {
     }
   }
   return { removed: 0 };
+}
+
+
+// New fields sent by a newer portal get their own column automatically, so the script rarely needs re-pasting.
+function addMissingColumns(tab, list) {
+  const sh = sheet(tab);
+  const head = sh.getRange(1, 1, 1, Math.max(1, sh.getLastColumn())).getValues()[0];
+  const want = [];
+  list.forEach(o => Object.keys(o).forEach(k => { if (head.indexOf(k) === -1 && want.indexOf(k) === -1) want.push(k); }));
+  if (want.length) sh.getRange(1, head.filter(String).length + 1, 1, want.length).setValues([want]);
+}
+
+// Move a presale record onto its BidPath auction id once the auction exists.
+function rekey(from, to, user) {
+  if (!from || !to || from === to) throw new Error('rekey needs two different ids');
+  const existing = read(['Sales'], to).Sales;
+  if (existing.length) throw new Error('That BidPath auction is already linked to another sale in the portal.');
+  let moved = 0;
+  ['Sales', 'Payees', 'Fees', 'Lots', 'Adjustments'].forEach(t => {
+    const { sh, head, data } = rows(t);
+    const ai = head.indexOf('auctionId'), ii = head.indexOf('id');
+    let changed = false;
+    data.forEach(r => {
+      if (String(r[ai]) === from) {
+        r[ai] = to; changed = true; moved++;
+        if (t === 'Adjustments' && ii !== -1) r[ii] = String(r[ii]).replace(from, to);
+      }
+    });
+    if (changed) sh.getRange(2, 1, data.length, head.length).setValues(data);
+  });
+  sheet('Log').appendRow([new Date().toISOString(), user, 'link', 'Sales', from + ' → ' + to, moved + ' rows moved']);
+  return { moved };
 }
