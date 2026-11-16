@@ -136,13 +136,14 @@ Write a newsletter blurb of 2-3 sentences (about 45-70 words) in the voice of Bi
 
 "This Raymond estate brings the garden to you, packed with outdoor décor, planters, birdhouses, and raised beds. This is the post-winter therapy we all need. (Also, please check out the cutest McCoy planter we have ever seen.)"
 
-PRIORITY ORDER for standouts: precious metals & jewelry; signed/named art; named collectibles (pottery makers, Tiffany, Waterford, Lionel, militaria, vintage toys); antique rugs; genuinely collectible named furniture (MCM, Drexel, Stickley); notable tools.
+PRIORITY ORDER for standouts: precious metals & jewelry; signed/named art; named collectibles (pottery makers, Tiffany, Waterford, Lionel, militaria, vintage toys); antique rugs; collectible named furniture (MCM, Drexel, Stickley); notable tools.
 
 VOICE RULES — follow these strictly:
 - Sound like a real person who has been in the house and is tipping off a friend
-- Name specific weird or exciting items with genuine enthusiasm
+- Name specific weird or exciting items with real enthusiasm
 - Parenthetical asides with personality are welcome
-- NEVER use: "collectors," "run of," "treasure trove," "curated" (unless quoting a title), "don't miss out," "something for everyone"
+- NEVER use: "collectors," "run of," "treasure trove," "curated" (unless quoting a title), "don't miss out," "something for everyone," "rounds things out," "round things out," "rounds out," "impressive range," "impressive," "genuinely," "genuine"
+- When naming highlights, lead in plainly (for example "includes," "you'll find," or just name the items). Don't introduce the list with praise or descriptive phrases about how good or varied it is.
 - Don't mention pickup days, shipping, or closing times
 - No marketing-speak, no generic filler
 - Return only the blurb text, no headers, no quotes, no formatting`;
